@@ -18,7 +18,7 @@
 # agents may rely on. Every mod folder carries a copy of this file stamped with its
 # version; edit shared/forge.py and run `npm run sync`.
 
-VERSION = "0.1.0+d3662d8a3b49"
+VERSION = "0.1.0+95594070a5c6"
 
 import json, os, random, re, shlex, sqlite3, subprocess, sys, time, urllib.parse
 from concurrent.futures import ThreadPoolExecutor
@@ -287,8 +287,11 @@ class GitLab:
     def run_on(self, fb, argv):
         # One ssh connection serves every call for 10 minutes (a new one takes seconds).
         # shlex.join: the remote shell must hand glab the same argv, whatever text is in it.
-        r = self.call(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", "-o", "ControlMaster=auto",
-                       "-o", f"ControlPath={HOME}/ssh-%C", "-o", "ControlPersist=600",
+        # ssh refuses a socket path of 104 bytes or more (macOS), so a long HOME goes without reuse.
+        reuse = ["-o", "ControlMaster=auto", "-o", f"ControlPath={HOME}/ssh-%C", "-o", "ControlPersist=600"]
+        if len(HOME) + len("/ssh-") + 40 >= 104:
+            reuse = []
+        r = self.call(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", *reuse,
                        "--", fb.dest, fb.command + " " + shlex.join(argv)], f"glab on {fb.dest}")
         if r.returncode == 127:
             raise NoCli(f"glab isn't found on {fb.dest}")
