@@ -1,0 +1,20 @@
+#!/usr/bin/env python3
+# A stand-in for ssh: logs [dest, remote command] to $FAKE_SSH/ssh.log, then runs the remote
+# command with `sh -c` here, as the remote shell would, with FAKE_GLAB pointed at
+# $FAKE_REMOTE_GLAB so the "remote" glab answers from its own routes. A destination named
+# "unreachable" fails the way ssh does, with 255.
+import json, os, subprocess, sys
+args = sys.argv[1:]
+while args and args[0] == "-o":
+    args = args[2:]
+if not args or args[0] != "--" or len(args) < 3:
+    sys.stderr.write(f"fake ssh: expected options, --, a destination and a command: {sys.argv[1:]}\n")
+    sys.exit(255)
+dest, command = args[1], " ".join(args[2:])
+with open(os.path.join(os.environ["FAKE_SSH"], "ssh.log"), "a") as f:
+    f.write(json.dumps([dest, command]) + "\n")
+if dest == "unreachable":
+    sys.stderr.write(f"ssh: connect to host {dest} port 22: Connection refused\n")
+    sys.exit(255)
+env = {**os.environ, "FAKE_GLAB": os.environ["FAKE_REMOTE_GLAB"]}
+sys.exit(subprocess.run(["sh", "-c", command], env=env).returncode)

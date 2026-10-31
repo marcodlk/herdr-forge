@@ -62,7 +62,11 @@ const out = await this.forge(["pipelines", provider, host, repo, maxAge, force ?
   (`pipelines: []` on a first failure). `forgeClient` returns it, including when it has
   `error`: with a cached answer, the data is the last good one, so show the data and the
   error. It throws only when python can't run or the output isn't JSON.
-- `nocli: true` with the error: the forge's CLI isn't installed on that machine.
+- `nocli: true` with the error: the forge's CLI isn't installed on that machine (or, for a
+  GitLab host with a `fallbacks` entry in Herdr's `forge.json`, on the fallback's machine).
+  With a fallback, GitLab calls that fail here for lack of glab or access (401, 403, not
+  logged in) run `<command> <argv quoted>` over ssh instead; an ssh failure is an `error`
+  naming ssh and the destination.
 - Times are epoch milliseconds (`*_ms`) everywhere; never `Date.parse` in a render.
 - **Reads take `maxAge` (seconds) and `force`.** The answer's `at` is when it was fetched
   (epoch seconds, 0: never).
@@ -256,6 +260,9 @@ several versions of forge.py against the same databases. The rules that keep tha
   - `forge.py`: the newest.
   - `<host>/<owner__project>.db`: the cache, including issue text and comments.
   - `<host>/backoff`: the rate-limit pause.
+  - `<host>/local-glab-failed`: glab here failed for that host; for an hour (by its
+    modification time) calls go straight to its fallback.
+  - `ssh-<hash>`: shared ssh connections to fallbacks, gone 10 minutes after the last call.
   - `git.db`: commit times per checkout (velocity), pruned after 30 days unused. `commits`
     only takes branch-like refs (letters, digits, `_ . / -`, not starting with `-`) and
     passes them after `--end-of-options` where the installed version supports it.

@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-# A stand-in for glab: answers from $FAKE_GLAB/routes.json and logs each call.
+# A stand-in for glab: answers from $FAKE_GLAB/routes.json and logs each call (calls.log: the
+# joined argv; argv.log: one JSON list per call, to check arguments survived quoting).
 # routes: [[regex over the joined argv, {"out": json | text} | {"err": text} | {"sleep": s, ...}]];
 # first match wins.
 import json, os, re, sys, time
@@ -7,6 +8,8 @@ d = os.environ["FAKE_GLAB"]
 argv = " ".join(sys.argv[1:])
 with open(os.path.join(d, "calls.log"), "a") as f:
     f.write(argv + "\n")
+with open(os.path.join(d, "argv.log"), "a") as f:
+    f.write(json.dumps(sys.argv[1:]) + "\n")
 for pattern, answer in json.load(open(os.path.join(d, "routes.json"))):
     if re.search(pattern, argv):
         if "sleep" in answer:

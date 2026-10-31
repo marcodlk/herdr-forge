@@ -518,6 +518,116 @@ class Forge(unittest.TestCase):
         ranks = dict(self.db().execute("SELECT iid, rank FROM triage"))
         self.assertEqual(ranks, {1: 2, 2: None, 3: None})
 
+    # -- fallbacks: glab over ssh when this machine's glab is refused --
+
+    FORBIDDEN = "glab: 403 Forbidden (GET https://gitlab.com/api/v4/projects)\n<html><center><h1>403 Forbidden</h1></center><hr><center>nginx</center></html>"
+
+    def fallback(self, entries, path=None):
+        """Writes `fallbacks` to forge.json (Herdr's folder, or `path`) and a separate remote glab."""
+        path = path or os.path.join(self.home, "herdr", "forge.json")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as f:
+            json.dump({"forges": {}, "fallbacks": entries}, f)
+        self.remote = os.path.join(self.home, "remote")
+        self.ssh = os.path.join(self.home, "ssh")
+        os.makedirs(self.remote, exist_ok=True)
+        os.makedirs(self.ssh, exist_ok=True)
+        self.remote_routes([])
+
+    def remote_routes(self, routes):
+        with open(os.path.join(self.remote, "routes.json"), "w") as f:
+            json.dump(routes, f)
+
+    def remote_argv(self):
+        try:
+            with open(os.path.join(self.remote, "argv.log")) as f:
+                return [json.loads(l) for l in f]
+        except FileNotFoundError:
+            return []
+
+    def ssh_calls(self):
+        try:
+            with open(os.path.join(self.ssh, "ssh.log")) as f:
+                return [json.loads(l) for l in f]
+        except FileNotFoundError:
+            return []
+
+    def run_remote(self, *args, **extra):
+        return self.run_forge(*args, HERDR_APP_HOME=os.path.join(self.home, "herdr"), FAKE_SSH=self.ssh,
+                              FAKE_REMOTE_GLAB=self.remote, **extra)
+
+    def test_a_refused_host_is_read_through_its_fallback_and_remembered(self):
+        # forge.json's default place: ~/.config/herdr-app
+        self.fallback({"gitlab.com": {"ssh": "ec2-alex", "command": "glab"}},
+                      os.path.join(self.home, ".config", "herdr-app", "forge.json"))
+        self.routes([[r".", {"err": self.FORBIDDEN}]])
+        self.remote_routes([[r"merge_requests\?state=opened", {"out": [mr(7)]}], [r"pipelines", {"out": []}]])
+        env = {"FAKE_SSH": self.ssh, "FAKE_REMOTE_GLAB": self.remote}
+        out = self.run_forge("requests", *P, 60, 0, **env)
+        self.assertIsNone(out["error"])
+        self.assertEqual([r["iid"] for r in out["requests"]], [7])
+        self.assertEqual({d for d, _ in self.ssh_calls()}, {"ec2-alex"})
+        local, remote = len(self.calls()), len(self.remote_argv())
+        out = self.run_forge("requests", *P, 60, 1, **env)
+        self.assertIsNone(out["error"])
+        self.assertEqual(len(self.calls()), local, "local glab isn't asked again within the hour")
+        self.assertGreater(len(self.remote_argv()), remote)
+
+    def test_fallback_arguments_reach_the_remote_glab_unchanged(self):
+        self.fallback({"gitlab.com": {"ssh": "ec2-alex", "command": "FAKE_X=\"$HOME\" glab"}})
+        self.sync_issues([issue(1)])
+        self.routes([[r".", {"err": "HTTP 401 Unauthorized"}]])
+        pwned = os.path.join(self.home, "pwned")
+        body = f"a 'b' \"c\" $HOME; touch {pwned} & $(touch {pwned}) `touch {pwned}` ! {{x}} ?a=1&b=2\nline 2"
+        self.remote_routes([[r"-X POST", {"out": {}}], [r"notes", {"out": []}], [r"related_merge_requests", {"out": []}],
+                            [r"issues/1", {"out": issue(1)}]])
+        out = self.run_remote("comment", *P, 1, body)
+        self.assertIsNone(out.get("error"))
+        posts = [a for a in self.remote_argv() if "POST" in a]
+        self.assertEqual(posts, [["api", "--hostname", "gitlab.com", "-X", "POST", "-f", f"body={body}",
+                                  "projects/acme%2Fshop/issues/1/notes"]])
+        self.assertFalse(os.path.exists(pwned), "nothing in the text ran")
+        self.assertEqual(len(self.ssh_calls()), len(self.remote_argv()), "one remote glab per ssh call, nothing else")
+
+    def test_a_fallback_without_glab_reports_no_cli(self):
+        self.fallback({"gitlab.com": {"ssh": "ec2-alex", "command": "/nonexistent/glab"},
+                       "git.acme.io": {"ssh": "unreachable", "command": "glab"}})
+        self.routes([[r".", {"err": self.FORBIDDEN}]])
+        out = self.run_remote("pipelines", *P, 60, 0)
+        self.assertTrue(out["nocli"])
+        self.assertEqual((out["pipelines"], out["error"]), ([], "glab isn't found on ec2-alex"))
+        out = self.run_remote("pipelines", "gitlab", "git.acme.io", "a/b", 60, 0)
+        self.assertNotIn("nocli", out)
+        self.assertIn("ssh to unreachable failed", out["error"])
+        self.assertIn("Connection refused", out["error"])
+
+    def test_a_host_without_a_fallback_fails_as_before(self):
+        self.fallback({"git.acme.io": {"ssh": "ec2-alex", "command": "glab"}})
+        self.routes([[r".", {"err": self.FORBIDDEN}]])
+        out = self.run_remote("pipelines", *P, 60, 0)
+        self.assertEqual(out["error"], self.FORBIDDEN)
+        self.assertEqual(self.ssh_calls(), [])
+
+    def test_a_fallback_that_reads_as_an_ssh_option_is_ignored_and_says_why(self):
+        self.fallback({"gitlab.com": {"ssh": "-oProxyCommand=touch /tmp/x", "command": "glab"}})
+        self.routes([[r".", {"err": self.FORBIDDEN}]])
+        out = self.run_remote("pipelines", *P, 60, 0)
+        self.assertEqual(self.ssh_calls(), [])
+        self.assertIn("403 Forbidden", out["error"])
+        self.assertIn("fallback for gitlab.com", out["error"])
+        self.assertIn("not starting with -", out["error"])
+
+    def test_other_local_failures_dont_use_the_fallback(self):
+        self.fallback({"gitlab.com": {"ssh": "ec2-alex", "command": "glab"}})
+        self.routes([[r".", {"err": "404 Not Found"}]])
+        self.assertEqual(self.run_remote("pipelines", *P, 60, 0)["error"], "404 Not Found")
+        self.assertEqual(self.ssh_calls(), [])
+        self.routes([[r"pipelines", {"out": []}]])
+        n = len(self.calls())
+        self.assertIsNone(self.run_remote("pipelines", *P, 60, 1)["error"])
+        self.assertGreater(len(self.calls()), n, "local glab still answers: a 404 isn't remembered")
+        self.assertEqual(self.ssh_calls(), [])
+
 
 if __name__ == "__main__":
     unittest.main()

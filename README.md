@@ -117,6 +117,32 @@ agent, or a different machine for `glab`:
 
 `forges` names self-hosted GitLab hosts that don't say "gitlab" in their name.
 
+`fallbacks` runs `glab` on another machine over ssh for a host that this machine's `glab` can't
+use, for example a GitLab that answers `403 Forbidden` to this computer:
+
+```json
+{
+  "fallbacks": {
+    "gitlab.odin.dso.mil": {
+      "ssh": "ec2-alex",
+      "command": "XDG_CONFIG_HOME=\"$HOME/snap/glab/current/.config\" /snap/glab/current/glab"
+    }
+  }
+}
+```
+
+- `ssh` is an ssh destination (a host, `user@host`, or a name from `~/.ssh/config`). It can't
+  contain spaces or start with `-`; an entry that breaks this is ignored, and the error says why.
+- `command` is the shell command line that runs `glab` on that machine. Its shell reads it, so
+  `$HOME` there is the remote home. The panels' arguments are quoted and added after it.
+- The fallback is used when `glab` here is missing or fails with an access error (401, 403, not
+  logged in). Other errors, such as a 404, show as usual. After a failure, that host goes straight
+  to the fallback for an hour.
+- ssh runs with `BatchMode=yes`, so the destination must work without a prompt: key
+  authentication, and a host key already accepted. One connection is reused for 10 minutes.
+- Fallbacks are read on the machine where `forge.py` runs (`on`), from Herdr's folder there
+  (`$HERDR_APP_HOME/forge.json`, else `~/.config/herdr-app/forge.json`).
+
 ### Panels in your layout
 
 Each panel is a mod, so you can place it in a layout of your own (a clone of `main`; see Herdr's
@@ -149,7 +175,7 @@ you've cloned, give the tab bar a button that runs `run("mod.open", { name: "for
 - **Agents:** buttons start agents with prompts that include issue and MR text. Anyone who can open
   an issue or MR wrote that text. The built-in prompts tell the agent to treat it as data and to ask
   before merging. Review your own prompts the same way.
-- **Programs:** `python3` and `glab` on the machine with your GitLab login, `git` in your checkouts
+- **Programs:** `python3` and `glab` on the machine with your GitLab login (`ssh` for a fallback), `git` in your checkouts
   (commit counts, and a worktree for Ship and Resolve), `xdg-open` or `open` for links.
 - **Files**, on each machine the panels talk to GitLab from, readable only by you:
   - `~/.local/share/herdr-forge/` (or `$HERDR_FORGE_HOME`): the panels' helper script and one SQLite

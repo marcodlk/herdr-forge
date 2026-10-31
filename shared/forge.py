@@ -7,6 +7,7 @@
 # seconds: an answer that fresh comes from the database, and while one process fetches,
 # the others get the last answer instead of fetching too. Writes go to the forge first
 # and drop the cached answers they change. A rate limit pauses every project on that host.
+# When glab can't reach a host from here, `fallbacks` in Herdr's forge.json runs it over ssh.
 #
 #   python3 -I forge.py <command> <provider> <host> <owner/project> [args...]
 #   python3 -I forge.py commits <top> <ref> <range> <now_ms> <tz_offset_min> <force 0|1>
@@ -19,9 +20,10 @@
 
 VERSION = "0.0.0+dev"
 
-import json, os, random, re, sqlite3, subprocess, sys, time, urllib.parse
+import json, os, random, re, shlex, sqlite3, subprocess, sys, time, urllib.parse
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
+from typing import NamedTuple
 
 # The cache holds issue text and comments, some of them private: nothing we write is
 # readable by other users of the machine.
@@ -205,6 +207,45 @@ def cycle_row(key, pairs, b, now_ms):
             "avg": median([m - c for m, c in pairs if m >= all_])}
 
 
+# ---- fallbacks: glab on another machine, for hosts that refuse this one ----
+
+class Fallback(NamedTuple):
+    dest: str     # an ssh destination
+    command: str  # a remote shell command line that runs glab
+
+
+# What sends a host to its fallback: no glab here, or the host refusing this machine's glab.
+LOCAL_REFUSED = re.compile(r"\b40[13]\b|unauthorized|forbidden|not logged in|not authenticated|no token|"
+                           r"authentication required", re.I)
+LOCAL_FAILED_FOR = 3600  # seconds a host goes straight to its fallback after local glab failed
+
+
+def load_fallbacks():
+    """({host: Fallback}, {host: why its entry is ignored}) from `fallbacks` in Herdr's
+    forge.json. A missing or unreadable file is no settings."""
+    path = os.path.join(os.environ.get("HERDR_APP_HOME") or os.path.expanduser("~/.config/herdr-app"), "forge.json")
+    try:
+        with open(path) as f:
+            raw = json.load(f)
+    except (OSError, ValueError):
+        return {}, {}
+    entries = raw.get("fallbacks") if isinstance(raw, dict) else None
+    good, bad = {}, {}
+    for host, e in (entries.items() if isinstance(entries, dict) else ()):
+        dest = e.get("ssh") if isinstance(e, dict) else None
+        command = e.get("command") if isinstance(e, dict) else None
+        # A destination starting with "-" would be read as an ssh option (-oProxyCommand=...).
+        if not isinstance(dest, str) or not dest or dest.startswith("-") or re.search(r"\s", dest) or CONTROL.search(dest):
+            why = "ssh must be a destination: not empty, no spaces or control characters, not starting with -"
+        elif not isinstance(command, str) or not command.strip():
+            why = "command must be the remote command line that runs glab"
+        else:
+            good[host] = Fallback(dest, command)
+            continue
+        bad[host] = f"the fallback for {host} in {path} is ignored: {why}"
+    return good, bad
+
+
 # ---- providers: each turns its forge's API into the shapes in docs/contract.md ----
 
 class GitLab:
@@ -216,6 +257,8 @@ class GitLab:
         self.p = p
         self.project = "projects/" + urllib.parse.quote(p.repo, safe="")
         self.url = f"https://{p.host}/{p.repo}"
+        good, bad = load_fallbacks()
+        self.fallback, self.fallback_ignored = good.get(p.host), bad.get(p.host)
 
     # -- transport --
 
@@ -226,19 +269,65 @@ class GitLab:
 
     def run(self, argv):
         self.p.check_backoff()
+        fb = self.fallback
+        if fb and self.local_failed_recently():
+            return self.run_on(fb, argv)
         try:
-            r = subprocess.run(["glab", *argv], capture_output=True, text=True, env=ENV, timeout=CLI_TIMEOUT)
+            return self.answer(self.call(["glab", *argv], "glab"), "glab")
+        except RuntimeError as e:
+            if not (isinstance(e, NoCli) or LOCAL_REFUSED.search(str(e))):
+                raise
+            if fb:
+                self.local_failed()
+                return self.run_on(fb, argv)
+            if self.fallback_ignored:
+                raise type(e)(f"{e} ({self.fallback_ignored})")
+            raise
+
+    def run_on(self, fb, argv):
+        # One ssh connection serves every call for 10 minutes (a new one takes seconds).
+        # shlex.join: the remote shell must hand glab the same argv, whatever text is in it.
+        r = self.call(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", "-o", "ControlMaster=auto",
+                       "-o", f"ControlPath={HOME}/ssh-%C", "-o", "ControlPersist=600",
+                       "--", fb.dest, fb.command + " " + shlex.join(argv)], f"glab on {fb.dest}")
+        if r.returncode == 127:
+            raise NoCli(f"glab isn't found on {fb.dest}")
+        if r.returncode == 255:
+            raise RuntimeError(f"ssh to {fb.dest} failed: {(r.stderr or '').strip()[-300:]}")
+        return self.answer(r, f"glab on {fb.dest}")
+
+    @staticmethod
+    def call(cmd, what):
+        try:
+            return subprocess.run(cmd, capture_output=True, text=True, env=ENV, timeout=CLI_TIMEOUT)
         except FileNotFoundError:
-            raise NoCli("glab isn't installed on this machine")
+            raise NoCli(f"{cmd[0]} isn't installed on this machine")
         except subprocess.TimeoutExpired:
-            raise RuntimeError(f"glab took longer than {CLI_TIMEOUT}s")
+            raise RuntimeError(f"{what} took longer than {CLI_TIMEOUT}s")
+
+    def answer(self, r, what):
         if r.returncode != 0:
-            err = (r.stderr or r.stdout).strip() or f"glab exited {r.returncode}"
+            err = (r.stderr or r.stdout).strip() or f"{what} exited {r.returncode}"
             wait = self.retry_after(err)
             if wait:
                 self.p.backoff(wait)
             raise RuntimeError(err[-500:])
         return r.stdout
+
+    # Per host: after local glab fails there, go straight to the fallback for an hour.
+    def _local_failed_file(self):
+        return os.path.join(HOME, self.p.host, "local-glab-failed")
+
+    def local_failed_recently(self):
+        try:
+            return time.time() - os.path.getmtime(self._local_failed_file()) < LOCAL_FAILED_FOR
+        except OSError:
+            return False
+
+    def local_failed(self):
+        os.makedirs(os.path.dirname(self._local_failed_file()), exist_ok=True)
+        with open(self._local_failed_file(), "w"):
+            pass
 
     def json(self, text):
         try:
